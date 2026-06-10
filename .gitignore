@@ -1,0 +1,28 @@
+# Dados reais e arquivos enviados por clientes
+*.csv
+*.xlsx
+*.xls
+*.txt
+
+# Saidas e logs locais
+*.log
+*.err
+*.out
+server*.job.log
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ambientes locais
+.env
+.venv/
+venv/
+env/
+
+# Arquivos do sistema/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
