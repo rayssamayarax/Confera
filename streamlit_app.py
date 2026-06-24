@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from core import analyze_balances, dataframe_to_excel, read_accounting_file
+from core import analyze_balances, dataframe_to_excel, read_accounting_file, sorted_report
 
 
 APP_DIR = Path(__file__).parent
@@ -534,8 +534,21 @@ def expected_label(row: pd.Series) -> str:
 
 
 def current_label(row: pd.Series) -> str:
+    side = str(row.get("Lado do saldo", "")).strip().upper()
+    if side == "D":
+        return "Devedor"
+    if side == "C":
+        return "Credor"
+
+    balance = float(row.get("Saldo final do dia", 0) or 0)
     nature = str(row.get("Natureza esperada", "")).lower()
-    return "Devedor" if nature == "credora" else "Credor" if nature == "devedora" else "Revisao"
+    if abs(balance) <= 0.004:
+        return "Zerado"
+    if nature == "credora":
+        return "Credor" if balance > 0 else "Devedor"
+    if nature == "devedora":
+        return "Devedor" if balance > 0 else "Credor"
+    return "Revisao"
 
 
 def metric_summary(result: pd.DataFrame, issues: pd.DataFrame) -> dict[str, str]:
@@ -687,7 +700,7 @@ def render_inconsistencias_table(issues: pd.DataFrame) -> None:
             use_container_width=True,
         )
 
-    filtered = issues.copy()
+    filtered = sorted_report(issues)
     if search:
         mask = filtered.apply(lambda row: search.lower() in " ".join(map(str, row.values)).lower(), axis=1)
         filtered = filtered[mask]
@@ -938,7 +951,7 @@ def render_sobre_page() -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Analisador Contábil",
-        page_icon="✓",
+        page_icon=str(LOGO_PATH),
         layout="wide",
         initial_sidebar_state="expanded",
     )
