@@ -61,6 +61,25 @@ REDUCER_TERMS = [
     "capital a integralizar",
 ]
 
+NEGATIVE_EXPECTED_REDUCER_ACCOUNT_CODES = {
+    "277",
+    "278",
+    "279",
+    "280",
+    "281",
+    "283",
+    "284",
+    "285",
+    "741",
+    "1684",
+    "1685",
+    "1686",
+    "1687",
+    "2333",
+}
+
+REDUCER_ACCOUNT_CODES = NEGATIVE_EXPECTED_REDUCER_ACCOUNT_CODES
+
 
 @dataclass
 class LedgerEntry:
@@ -71,10 +90,14 @@ class LedgerEntry:
     credito: float
     saldo_final_dia: float
     lado_saldo: str
+    saldo_anterior_inicial: float = 0.0
+    lado_saldo_anterior: str = ""
+    tem_saldo_anterior: bool = False
 
 
 @lru_cache(maxsize=20000)
 def normalize_text_cached(text: str) -> str:
+    text = text.replace("\ufeff", "").replace("\u200b", "").replace("ï»¿", "")
     text = unicodedata.normalize("NFKD", text)
     text = "".join(char for char in text if not unicodedata.combining(char))
     return re.sub(r"\s+", " ", text).strip().lower()
@@ -152,6 +175,17 @@ def parse_balance_value(value: object) -> tuple[float, str]:
     return parse_brazilian_number(text), side
 
 
+def signed_balance_for_expected(value: float, side: str, expected: str) -> float:
+    side = str(side or "").strip().upper()
+    expected = str(expected or "").strip().lower()
+
+    if side == "D":
+        return abs(value) if expected == "devedora" else -abs(value)
+    if side == "C":
+        return abs(value) if expected == "credora" else -abs(value)
+    return value
+
+
 @lru_cache(maxsize=5000)
 def parse_date_cached(text: str) -> pd.Timestamp:
     try:
@@ -191,24 +225,42 @@ def read_csv_semicolon(uploaded_file: BinaryIO) -> pd.DataFrame:
 
 def read_csv_semicolon_bytes(raw: bytes) -> pd.DataFrame:
     last_error: Exception | None = None
+    best_df: pd.DataFrame | None = None
+    best_width = 0
     for encoding in ("utf-8-sig", "latin1", "cp1252"):
-        try:
-            return pd.read_csv(
-                io.BytesIO(raw),
-                sep=";",
-                dtype=str,
-                encoding=encoding,
-                keep_default_na=False,
-            )
-        except UnicodeDecodeError as exc:
-            last_error = exc
-            continue
-        except pd.errors.ParserError:
+        for sep in (";", "\t", ","):
             try:
-                return read_csv_semicolon_relaxed(raw, encoding)
-            except Exception as exc:
+                candidate = pd.read_csv(
+                    io.BytesIO(raw),
+                    sep=sep,
+                    dtype=str,
+                    encoding=encoding,
+                    keep_default_na=False,
+                ).fillna("")
+                if len(candidate.columns) > best_width or (
+                    len(candidate.columns) == best_width
+                    and best_df is not None
+                    and "ï»¿" in " ".join(map(str, best_df.columns))
+                ):
+                    best_df = candidate
+                    best_width = len(candidate.columns)
+                if best_width > 1 and sep == ";" and "ï»¿" not in " ".join(map(str, candidate.columns)):
+                    return candidate
+            except UnicodeDecodeError as exc:
                 last_error = exc
-                continue
+                break
+            except pd.errors.ParserError:
+                try:
+                    candidate = read_csv_semicolon_relaxed(raw, encoding)
+                    if len(candidate.columns) > best_width:
+                        best_df = candidate
+                        best_width = len(candidate.columns)
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+    if best_df is not None:
+        return best_df
 
     if last_error:
         raise last_error
@@ -283,8 +335,23 @@ def rename_columns(df: pd.DataFrame, expected: list[str]) -> pd.DataFrame:
     lookup = {normalize_text(column): column for column in df.columns}
     rename_map = {}
 
+    aliases = {
+        "Código": ["codigo", "cod", "cod.", "cód", "cód.", "codigo conta", "codigo da conta", "conta"],
+        "Classificação": ["classificacao", "classif", "classif.", "classificação"],
+        "Tipo": ["tipo"],
+        "Nome": ["nome", "descricao", "descrição", "descriçao", "descr", "conta contabil", "conta contábil"],
+        "Grupo": ["grupo"],
+        "Relatório": ["relatorio", "relatório"],
+        "Saldo": ["saldo", "natureza", "saldo/natureza"],
+    }
+
     for column in expected:
         actual = lookup.get(normalize_text(column))
+        if not actual:
+            for alias in aliases.get(column, []):
+                actual = lookup.get(normalize_text(alias))
+                if actual:
+                    break
         if actual:
             rename_map[actual] = column
 
@@ -312,9 +379,13 @@ def normalize_ledger_columns(df: pd.DataFrame) -> pd.DataFrame:
         current_code = ""
         current_name = ""
         current_date: pd.Timestamp | None = None
+        current_account_key: tuple[str, str] | None = None
+        current_reference_balance = 0.0
+        account_last_balance: dict[tuple[str, str], float] = {}
         movements: list[dict[str, object]] = []
 
         def flush_day() -> None:
+            nonlocal current_reference_balance
             if not movements:
                 return
 
@@ -337,25 +408,35 @@ def normalize_ledger_columns(df: pd.DataFrame) -> pd.DataFrame:
             if total_debit is not None and abs(sum_values - total_debit) <= 0.02 and abs((total_credit or 0.0)) <= 0.02:
                 for movement, value in zip(regular, values):
                     debits[int(movement["index"])] = format_brazilian_number(value)
+                    current_reference_balance = parse_brazilian_number(movement["saldo"])
+                    if current_account_key is not None:
+                        account_last_balance[current_account_key] = current_reference_balance
                 return
 
             if total_credit is not None and abs(sum_values - total_credit) <= 0.02 and abs((total_debit or 0.0)) <= 0.02:
                 for movement, value in zip(regular, values):
                     credits[int(movement["index"])] = format_brazilian_number(value)
+                    current_reference_balance = parse_brazilian_number(movement["saldo"])
+                    if current_account_key is not None:
+                        account_last_balance[current_account_key] = current_reference_balance
                 return
 
-            previous = None
             for movement, value in zip(regular, values):
                 saldo = parse_brazilian_number(movement["saldo"])
-                if previous is None:
-                    delta = saldo - parse_brazilian_number(movement["saldo_anterior"])
+                delta = saldo - current_reference_balance
+                current_reference_balance = saldo
+                if current_account_key is not None:
+                    account_last_balance[current_account_key] = current_reference_balance
+
+                if current_code == "148":
+                    increases_on_debit = False
                 else:
-                    delta = saldo - previous
-                previous = saldo
-                if delta >= 0:
-                    credits[int(movement["index"])] = format_brazilian_number(value)
-                else:
+                    increases_on_debit = True
+
+                if (delta >= 0 and increases_on_debit) or (delta < 0 and not increases_on_debit):
                     debits[int(movement["index"])] = format_brazilian_number(value)
+                else:
+                    credits[int(movement["index"])] = format_brazilian_number(value)
 
         historicos = df["Hist\u00f3rico"].astype(str).tolist()
         chaves = df["Chave"].astype(str).tolist()
@@ -392,6 +473,11 @@ def normalize_ledger_columns(df: pd.DataFrame) -> pd.DataFrame:
                 movements = []
                 current_code = next_code
                 current_name = next_name
+                current_account_key = (current_code, current_name)
+                opening_balance = parse_brazilian_number(saldo)
+                if current_account_key not in account_last_balance:
+                    account_last_balance[current_account_key] = opening_balance
+                current_reference_balance = account_last_balance[current_account_key]
                 current_date = None
                 continue
 
@@ -459,6 +545,9 @@ def parse_ledger(df: pd.DataFrame) -> pd.DataFrame:
     current_code = ""
     current_name = ""
     current_date: pd.Timestamp | None = None
+    current_opening_balance = 0.0
+    current_opening_side = ""
+    current_has_opening_balance = False
     daily: dict[tuple[str, str, pd.Timestamp], LedgerEntry] = {}
 
     historicos = df["Hist\u00f3rico"].astype(str).tolist()
@@ -499,6 +588,10 @@ def parse_ledger(df: pd.DataFrame) -> pd.DataFrame:
             )
             current_code = next_code
             current_name = next_name
+            if not is_same_continuation:
+                opening_text = saldo_raw.strip()
+                current_opening_balance, current_opening_side = parse_balance_value(opening_text)
+                current_has_opening_balance = bool(opening_text)
             if not is_same_continuation and not debito_norm.startswith("saldo da pagina anterior"):
                 current_date = None
             continue
@@ -529,6 +622,9 @@ def parse_ledger(df: pd.DataFrame) -> pd.DataFrame:
                 credito=entry.credito + credito,
                 saldo_final_dia=saldo_value,
                 lado_saldo=saldo_side,
+                saldo_anterior_inicial=entry.saldo_anterior_inicial,
+                lado_saldo_anterior=entry.lado_saldo_anterior,
+                tem_saldo_anterior=entry.tem_saldo_anterior,
             )
         else:
             daily[key] = LedgerEntry(
@@ -539,6 +635,9 @@ def parse_ledger(df: pd.DataFrame) -> pd.DataFrame:
                 credito=credito,
                 saldo_final_dia=saldo_value,
                 lado_saldo=saldo_side,
+                saldo_anterior_inicial=current_opening_balance,
+                lado_saldo_anterior=current_opening_side,
+                tem_saldo_anterior=current_has_opening_balance,
             )
 
     return pd.DataFrame([entry.__dict__ for entry in daily.values()])
@@ -587,12 +686,86 @@ def ledger_file_diagnostics(df: pd.DataFrame) -> dict[str, object]:
     }
 
 
+def infer_plan_from_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty and len(df.columns) > 1:
+        df = pd.DataFrame([list(df.columns)], columns=[f"col_{index}" for index in range(len(df.columns))])
+    if df.empty:
+        return pd.DataFrame(columns=PLAN_COLUMNS)
+
+    work = df.fillna("").astype(str).copy()
+    work = work.map(lambda value: "" if re.fullmatch(r"Unnamed:\s*\d+", str(value).strip(), flags=re.IGNORECASE) else value)
+    scores: list[tuple[int, int]] = []
+    for index, column in enumerate(work.columns):
+        values = work[column].map(normalize_code)
+        score = int(values.map(lambda value: bool(re.fullmatch(r"\d+", value))).sum())
+        scores.append((score, index))
+
+    score, code_index = max(scores, default=(0, 0))
+    if score == 0:
+        return pd.DataFrame(columns=PLAN_COLUMNS)
+
+    columns = list(work.columns)
+    code_col = columns[code_index]
+    normalized_codes = work[code_col].map(normalize_code)
+    result = pd.DataFrame({"Código": normalized_codes})
+
+    def first_existing(offsets: list[int]) -> pd.Series:
+        for offset in offsets:
+            candidate_index = code_index + offset
+            if 0 <= candidate_index < len(columns):
+                series = work[columns[candidate_index]].astype(str).str.strip()
+                if series.ne("").any():
+                    return series
+        return pd.Series([""] * len(work), index=work.index)
+
+    if "Classificação" in work.columns:
+        result["Classificação"] = work["Classificação"]
+    else:
+        result["Classificação"] = first_existing([1, 2])
+
+    if "Tipo" in work.columns:
+        result["Tipo"] = work["Tipo"]
+    else:
+        result["Tipo"] = ""
+
+    if "Nome" in work.columns:
+        result["Nome"] = work["Nome"]
+    else:
+        result["Nome"] = first_existing([2, 3, 1])
+
+    if "Grupo" in work.columns:
+        result["Grupo"] = work["Grupo"]
+    else:
+        result["Grupo"] = first_existing([5, 4, 6])
+
+    if "Relatório" in work.columns:
+        result["Relatório"] = work["Relatório"]
+    else:
+        result["Relatório"] = ""
+
+    if "Saldo" in work.columns:
+        result["Saldo"] = work["Saldo"]
+    else:
+        result["Saldo"] = first_existing([6, 5, 4])
+
+    result = result[result["Código"].astype(str).str.strip().ne("")]
+    result = result[~result["Código"].map(normalize_text).isin({"codigo", "cod", "conta"})]
+    for column in PLAN_COLUMNS:
+        if column not in result.columns:
+            result[column] = ""
+    return result[PLAN_COLUMNS].copy()
+
+
 def prepare_plan(df: pd.DataFrame) -> pd.DataFrame:
     df = rename_columns(df, PLAN_COLUMNS)
     if "Código" not in df.columns:
         printed_plan = parse_sci_printed_plan(df)
         if not printed_plan.empty:
             df = printed_plan
+        else:
+            inferred_plan = infer_plan_from_columns(df)
+            if not inferred_plan.empty:
+                df = inferred_plan
 
     errors = validate_columns(df, ["C\u00f3digo"], "Plano de contas")
     if errors:
@@ -636,11 +809,20 @@ def infer_base_nature(row: pd.Series) -> tuple[str, str]:
 
 
 def is_reducer(row: pd.Series) -> bool:
+    code = normalize_code(row.get("codigo", row.get("C\u00f3digo", "")))
+    if code in REDUCER_ACCOUNT_CODES:
+        return True
+
     combined = normalize_text(
         " ".join(str(row.get(column, "")) for column in ["nome_razao", "Nome", "Grupo", "Classifica\u00e7\u00e3o"])
     )
     normalized_terms = [normalize_text(term) for term in REDUCER_TERMS]
     return any(term in combined for term in normalized_terms)
+
+
+def expects_negative_balance(row: pd.Series) -> bool:
+    code = normalize_code(row.get("codigo", row.get("C\u00f3digo", "")))
+    return code in NEGATIVE_EXPECTED_REDUCER_ACCOUNT_CODES
 
 
 def invert_nature(nature: str) -> str:
@@ -664,6 +846,17 @@ def movement_impact(row: pd.Series) -> float:
     return 0.0
 
 
+def side_from_signed_balance(balance: float, expected: str) -> str:
+    expected = str(expected or "").strip().lower()
+    if abs(balance) <= 0.004:
+        return ""
+    if expected == "credora":
+        return "C" if balance > 0 else "D"
+    if expected == "devedora":
+        return "D" if balance > 0 else "C"
+    return ""
+
+
 def recalculate_running_balances(result: pd.DataFrame) -> pd.DataFrame:
     result = result.copy()
     result["_ordem_original"] = range(len(result))
@@ -676,15 +869,63 @@ def recalculate_running_balances(result: pd.DataFrame) -> pd.DataFrame:
             continue
 
         first = group.iloc[0]
-        initial_balance = float(first["saldo_final_dia"]) - float(first["_impacto"])
+        expected = str(first.get("Natureza esperada", ""))
+        if bool(first.get("tem_saldo_anterior", False)):
+            initial_balance = signed_balance_for_expected(
+                float(first.get("saldo_anterior_inicial", 0.0)),
+                str(first.get("lado_saldo_anterior", "")),
+                expected,
+            )
+        else:
+            initial_balance = float(first["saldo_final_dia"]) - float(first["_impacto"])
         running_balance = initial_balance
 
         for index, row in group.iterrows():
             running_balance += float(row["_impacto"])
             result.at[index, "saldo_final_dia"] = round(running_balance, 2)
+            result.at[index, "lado_saldo"] = side_from_signed_balance(running_balance, expected)
             result.at[index, "Saldo recalculado por movimentos"] = "sim"
 
     return result.drop(columns=["_ordem_original", "_impacto"])
+
+
+def balance_issue_type(row: pd.Series) -> str:
+    balance = float(row.get("saldo_final_dia", 0.0))
+
+    if bool(row.get("Eh redutora", False)):
+        if balance > 0:
+            return "Conta redutora com saldo positivo"
+        return ""
+
+    expected = str(row.get("Natureza esperada", "")).strip().lower()
+    if expected not in {"devedora", "credora"}:
+        return ""
+
+    side = str(row.get("lado_saldo", "")).strip().upper()
+
+    if expected == "devedora":
+        if side == "C" or (not side and balance < 0):
+            return "Saldo credor em conta de natureza devedora"
+        return ""
+
+    if side == "D" or (not side and balance < 0):
+        return "Saldo devedor em conta de natureza credora"
+    return ""
+
+
+def balance_issue_observation(row: pd.Series) -> str:
+    issue_type = str(row.get("Tipo de inconsistencia", ""))
+    if not issue_type:
+        return ""
+
+    side = str(row.get("lado_saldo", "")).strip().upper()
+    if "redutora" in issue_type:
+        return "Esta conta e redutora/retificadora e deve permanecer negativa no SCI. Conferir quando o saldo estiver positivo."
+
+    if side:
+        return "O SCI exibiu saldo com lado diferente da natureza esperada para esta conta/data."
+
+    return "O SCI exibiu saldo negativo para esta conta/data. Conferir se o saldo esta invertido."
 
 
 def collapse_issue_sequences(output: pd.DataFrame) -> pd.DataFrame:
@@ -772,37 +1013,25 @@ def analyze_balances(ledger_df: pd.DataFrame, plan_df: pd.DataFrame) -> tuple[pd
     recalculable = result["Natureza esperada"].isin(["devedora", "credora"]) & participant_account
     if recalculable.any():
         recalculated = recalculate_running_balances(result.loc[recalculable].copy())
-        result.loc[recalculated.index, ["saldo_final_dia", "Saldo recalculado por movimentos"]] = recalculated[
-            ["saldo_final_dia", "Saldo recalculado por movimentos"]
+        result.loc[recalculated.index, ["saldo_final_dia", "lado_saldo", "Saldo recalculado por movimentos"]] = recalculated[
+            ["saldo_final_dia", "lado_saldo", "Saldo recalculado por movimentos"]
         ]
 
     result["Tipo de inconsistencia"] = ""
-    normal_negative_balance = (~result["Eh redutora"]) & (result["saldo_final_dia"] < 0)
-    reducer_positive_balance = result["Eh redutora"] & (result["saldo_final_dia"] > 0)
     compensation = result["Natureza esperada"].eq("revisao")
-    undefined = result["Natureza esperada"].eq("indefinida")
+    undefined = result["Natureza esperada"].eq("indefinida") & ~result["Eh redutora"]
+    issue_by_nature = result.apply(balance_issue_type, axis=1)
 
-    result.loc[normal_negative_balance, "Tipo de inconsistencia"] = "Saldo negativo no razao SCI"
-    result.loc[
-        normal_negative_balance & result["Natureza esperada"].eq("credora"),
-        "Tipo de inconsistencia",
-    ] = "Saldo devedor em conta de natureza credora"
-    result.loc[
-        normal_negative_balance & result["Natureza esperada"].eq("devedora"),
-        "Tipo de inconsistencia",
-    ] = "Saldo credor em conta de natureza devedora"
-    result.loc[reducer_positive_balance, "Tipo de inconsistencia"] = "Conta redutora com saldo positivo no razao SCI"
+    result.loc[issue_by_nature.ne(""), "Tipo de inconsistencia"] = issue_by_nature[issue_by_nature.ne("")]
     result.loc[compensation, "Tipo de inconsistencia"] = "Conta de compensacao para revisao"
     result.loc[undefined, "Tipo de inconsistencia"] = "Natureza nao identificada"
 
-    needs_negative_review = normal_negative_balance & result["Observacao"].fillna("").eq("")
-    result.loc[needs_negative_review, "Observacao"] = (
-        "O SCI exibiu saldo negativo para esta conta/data. Conferir se o saldo esta invertido."
-    )
-    needs_reducer_review = reducer_positive_balance & result["Observacao"].fillna("").eq("")
-    result.loc[needs_reducer_review, "Observacao"] = (
-        "Conta redutora costuma aparecer negativa no SCI. Conferir saldo positivo nesta data."
-    )
+    needs_balance_review = issue_by_nature.ne("") & result["Observacao"].fillna("").eq("")
+    if needs_balance_review.any():
+        result.loc[needs_balance_review, "Observacao"] = result.loc[needs_balance_review].apply(
+            balance_issue_observation,
+            axis=1,
+        )
     output = pd.DataFrame(
         {
             "Codigo da conta": result["codigo"],
@@ -824,7 +1053,7 @@ def analyze_balances(ledger_df: pd.DataFrame, plan_df: pd.DataFrame) -> tuple[pd
     )
 
     inconsistencies = collapse_issue_sequences(output)
-    return output, inconsistencies
+    return sorted_report(output), sorted_report(inconsistencies)
 
 
 AZUL_ESCURO = "1F3864"
@@ -885,12 +1114,55 @@ def safe_days(value: object) -> int:
         return 1
 
 
+def sorted_report(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    result = df.copy()
+    grupo = result["Grupo"] if "Grupo" in result.columns else pd.Series([""] * len(result), index=result.index)
+    conta = (
+        result["Nome da conta no razao"]
+        if "Nome da conta no razao" in result.columns
+        else pd.Series([""] * len(result), index=result.index)
+    )
+    codigo = (
+        result["Codigo da conta"]
+        if "Codigo da conta" in result.columns
+        else pd.Series([""] * len(result), index=result.index)
+    )
+    data = result["Data"] if "Data" in result.columns else pd.Series([""] * len(result), index=result.index)
+    result["_grupo_ordem"] = grupo.map(normalize_text)
+    result["_conta_ordem"] = conta.map(normalize_text)
+    result["_codigo_ordem"] = codigo.map(normalize_code)
+    result["_data_ordem"] = pd.to_datetime(data, format="%d/%m/%Y", errors="coerce")
+    result = result.sort_values(
+        ["_grupo_ordem", "_conta_ordem", "_codigo_ordem", "_data_ordem"],
+        kind="mergesort",
+    )
+    return result.drop(columns=["_grupo_ordem", "_conta_ordem", "_codigo_ordem", "_data_ordem"])
+
+
+def safe_sheet_title(value: object, used: set[str]) -> str:
+    title = str(value or "Sem Grupo").strip() or "Sem Grupo"
+    title = re.sub(r"[\[\]\:\*\?\/\\]", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()[:31] or "Sem Grupo"
+    base = title
+    counter = 2
+    while title in used:
+        suffix = f" {counter}"
+        title = f"{base[:31 - len(suffix)]}{suffix}"
+        counter += 1
+    used.add(title)
+    return title
+
+
 def dataframe_to_excel(df: pd.DataFrame) -> bytes:
     df = df.copy()
     if "Dias impactados" not in df.columns:
         df["Dias impactados"] = 1
     df["Dias impactados"] = df["Dias impactados"].map(safe_days)
     df["Saldo final do dia"] = pd.to_numeric(df.get("Saldo final do dia", 0), errors="coerce").fillna(0)
+    df = sorted_report(df)
 
     buffer = io.BytesIO()
     wb = Workbook()
@@ -906,6 +1178,16 @@ def dataframe_to_excel(df: pd.DataFrame) -> bytes:
     by_account = wb.create_sheet("Por Conta")
     by_account.sheet_view.showGridLines = False
     build_excel_by_account(by_account, df)
+
+    used_titles = {sheet.title for sheet in wb.worksheets}
+    for group_name, group_df in df.groupby("Grupo", sort=False, dropna=False):
+        group_sheet = wb.create_sheet(safe_sheet_title(group_name, used_titles))
+        group_sheet.sheet_view.showGridLines = False
+        build_excel_detail(
+            group_sheet,
+            group_df,
+            title=f"ANALISE DE SALDOS DIARIOS - {str(group_name or 'SEM GRUPO').upper()}",
+        )
 
     wb.save(buffer)
     return buffer.getvalue()
@@ -1007,12 +1289,12 @@ def add_distribution_section(ws, df: pd.DataFrame, start_row: int, title: str, g
     return row
 
 
-def build_excel_detail(ws, df: pd.DataFrame) -> None:
+def build_excel_detail(ws, df: pd.DataFrame, title: str = "ANALISE DE SALDOS DIARIOS - DETALHAMENTO COMPLETO") -> None:
     widths = {"A": 8, "B": 30, "C": 12, "D": 10, "E": 12, "F": 15, "G": 10, "H": 45, "I": 8, "J": 14}
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
     ws.merge_cells("A1:J1")
-    ws["A1"] = "ANALISE DE SALDOS DIARIOS - DETALHAMENTO COMPLETO"
+    ws["A1"] = title
     estilo_cabecalho(ws["A1"], AZUL_ESCURO)
     ws["A1"].font = Font(name="Arial", bold=True, color=BRANCO, size=13)
     ws.row_dimensions[1].height = 36
@@ -1020,7 +1302,7 @@ def build_excel_detail(ws, df: pd.DataFrame) -> None:
     for col, header in enumerate(headers, 1):
         estilo_cabecalho(ws.cell(2, col, header), AZUL_MED)
 
-    ordered = df.sort_values(["Grupo", "Codigo da conta", "Data"]) if not df.empty else df
+    ordered = sorted_report(df) if not df.empty else df
     for row_idx, (_, row) in enumerate(ordered.iterrows(), 3):
         values = [
             row.get("Codigo da conta", ""),
@@ -1072,7 +1354,9 @@ def build_excel_by_account(ws, df: pd.DataFrame) -> None:
             tipo=("Tipo de inconsistencia", lambda s: s.mode().iloc[0] if not s.mode().empty else ""),
         )
         .reset_index()
-        .sort_values("ocorrencias", ascending=False)
+        .assign(_grupo_ordem=lambda data: data["Grupo"].map(normalize_text), _conta_ordem=lambda data: data["Nome da conta no razao"].map(normalize_text))
+        .sort_values(["_grupo_ordem", "_conta_ordem", "Codigo da conta"], kind="mergesort")
+        .drop(columns=["_grupo_ordem", "_conta_ordem"])
     )
     for row_idx, (_, row) in enumerate(grouped.iterrows(), 3):
         values = [row["Codigo da conta"], row["Nome da conta no razao"], row["Grupo"], int(row["ocorrencias"]), int(row["dias"]), float(row["saldo"]), row["tipo"]]
