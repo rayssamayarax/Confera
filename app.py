@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
-from core import analyze_balances, dataframe_to_excel, ledger_file_diagnostics, read_accounting_file
+from core import analyze_balances, dataframe_to_excel, ledger_file_diagnostics, read_accounting_file, sorted_report
 
 
 warnings.filterwarnings("ignore", message="'cgi' is deprecated.*", category=DeprecationWarning)
@@ -895,7 +895,7 @@ class AppHandler(BaseHTTPRequestHandler):
             plan_df = read_accounting_file(plan_item.file, plan_item.filename or "")
             ledger_df = read_accounting_file(ledger_item.file, ledger_item.filename or "")
             result, inconsistencies = analyze_balances(ledger_df, plan_df)
-            report = enrich_report(inconsistencies if not inconsistencies.empty else result.head(0), result)
+            report = sorted_report(enrich_report(inconsistencies if not inconsistencies.empty else result.head(0), result))
             diagnostics = ledger_file_diagnostics(ledger_df)
 
             analysis_id = uuid.uuid4().hex
@@ -969,7 +969,7 @@ def enrich_report(report: pd.DataFrame, result: pd.DataFrame | None = None) -> p
     report["_codigo"] = report.apply(display_code, axis=1)
     report["_descricao"] = report.apply(display_description, axis=1)
     report["_esperado"] = report["Natureza esperada"].map({"credora": "Credor", "devedora": "Devedor"}).fillna("Revisao")
-    report["_atual"] = report["Natureza esperada"].map({"credora": "Devedor", "devedora": "Credor"}).fillna("Revisao")
+    report["_atual"] = report.apply(current_balance_label, axis=1)
     report["_history"] = [[] for _ in range(len(report))]
     report["_detail_rows"] = [[] for _ in range(len(report))]
     report["_launch_count"] = report["Dias impactados"].fillna(1).astype(str)
@@ -1024,6 +1024,24 @@ def enrich_report(report: pd.DataFrame, result: pd.DataFrame | None = None) -> p
         report["_detail_rows"] = detail_rows
         report["_launch_count"] = launch_counts
     return report
+
+
+def current_balance_label(row: pd.Series) -> str:
+    side = str(row.get("Lado do saldo", "")).strip().upper()
+    if side == "D":
+        return "Devedor"
+    if side == "C":
+        return "Credor"
+
+    balance = float(row.get("Saldo final do dia", 0) or 0)
+    expected = str(row.get("Natureza esperada", "")).lower()
+    if abs(balance) <= 0.004:
+        return "Zerado"
+    if expected == "credora":
+        return "Credor" if balance > 0 else "Devedor"
+    if expected == "devedora":
+        return "Devedor" if balance > 0 else "Credor"
+    return "Revisao"
 
 
 def classify_row(row: pd.Series) -> str:
